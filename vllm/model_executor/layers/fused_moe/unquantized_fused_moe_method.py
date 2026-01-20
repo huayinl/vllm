@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+from itertools import count
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
 
+import vllm
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
@@ -47,6 +51,57 @@ else:
 
 logger = init_logger(__name__)
 
+_REQUEST_ID_GEN = count(0)
+def _log_moe_routing(
+        log_path: str, 
+        model_id: str, 
+        seed: int,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+):    
+    # Write metadata header once
+    # Check if the header already exists to avoid duplicates
+    if not os.path.exists(log_path) or os.path.getsize(log_path) <= 0:
+        metadata = {
+            "type": "meta",
+            "model_id": model_id,
+            "vllm_version": vllm.__version__,
+            "torch_version": torch.__version__,
+            "device": "GPU" if torch.cuda.is_available() else "CPU",
+            "seed": seed,
+            "layers_logged": [layer_id],
+            "top_k": topk_ids.size(1),
+        }
+        
+        with open(log_path, "w") as f:
+            f.write(json.dumps(metadata) + "\n")
+
+    # WARNING: .cpu() triggers a GPU<->CPU synchronization.
+    # This adds latency to the forward pass but is necessary to extract
+    # routing data for serialization.
+    ids_list = topk_ids.cpu().tolist()
+    weights_list = topk_weights.cpu().tolist()
+
+    current_idx = next(_REQUEST_ID_GEN)
+    req_id = f"r{os.getpid()}-{current_idx}"
+    
+
+    # Pre-format records to strings to minimize file I/O operations.
+    records = []
+    for i, (t_ids, t_weights) in enumerate(zip(ids_list, weights_list)):
+        record = {
+            "type": "route",
+            "req_id": req_id, 
+            "token_idx": i,
+            "layer": layer_id,
+            "topk_ids": t_ids,
+            "topk_weights": t_weights,
+        }
+        records.append(json.dumps(record) + "\n")
+    
+    with open(log_path, "a") as f:
+        f.writelines(records)
 
 # --8<-- [start:unquantized_fused_moe]
 @CustomOp.register("unquantized_fused_moe")
@@ -289,6 +344,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             hidden_states=x,
             router_logits=router_logits,
         )
+
+        # Log MoE routing if enabled for this layer
+        log_path = os.environ.get("VLLM_LOG_MOE")
+        layer_id = getattr(layer, "layer_id", -1)
+        if log_path and int(os.environ.get("VLLM_LOG_MOE_LAYER", "-1")) == layer_id:
+            log_model_id = os.environ.get("VLLM_LOG_MOE_MODEL", "unknown")
+            seed_env = os.environ.get("VLLM_LOG_MOE_SEED")
+            log_seed = int(seed_env) if seed_env and seed_env.isdigit() else -1
+
+            _log_moe_routing(
+                log_path=log_path,
+                model_id=log_model_id,
+                seed=log_seed,
+                layer_id=layer_id,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
         result = self.kernel(
             hidden_states=x,
